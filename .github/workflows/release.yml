@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CI: true
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+      WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+      WINDOWS_SIGN_COMMAND: ${{ secrets.WINDOWS_SIGN_COMMAND }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            label: macOS
+            formats: app,dmg
+            artifact_name: macos-release-artifacts
+          - os: windows-latest
+            label: Windows
+            formats: nsis,wix
+            artifact_name: windows-release-artifacts
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as fh:
+              cargo = tomllib.load(fh)
+
+          version = cargo["package"]["version"]
+          expected_tag = f"v{version}"
+          actual_tag = os.environ["GITHUB_REF_NAME"]
+
+          if actual_tag != expected_tag:
+              raise SystemExit(
+                  f"tag {actual_tag!r} does not match Cargo.toml version {expected_tag!r}"
+              )
+          PY
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Write App Store Connect API key
+        if: runner.os == 'macOS' && env.APPLE_API_KEY != ''
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          key_path="$RUNNER_TEMP/private_keys/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY" > "$key_path"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Generate CI packager config
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+
+          with open("Cargo.toml", "rb") as fh:
+              cargo = tomllib.load(fh)
+
+          version = cargo["package"]["version"]
+
+          windows_lines = [
+              "[windows]",
+              "allow-downgrades = false",
+          ]
+          thumbprint = os.environ.get("WINDOWS_CERTIFICATE_THUMBPRINT", "").strip()
+          if thumbprint:
+              windows_lines.append(f"certificate-thumbprint = {json.dumps(thumbprint)}")
+          timestamp_url = os.environ.get("WINDOWS_TIMESTAMP_URL", "").strip()
+          if timestamp_url:
+              windows_lines.append(f"timestamp-url = {json.dumps(timestamp_url)}")
+          sign_command = os.environ.get("WINDOWS_SIGN_COMMAND", "").strip()
+          if sign_command:
+              windows_lines.append(f"sign-command = {json.dumps(sign_command)}")
+
+          macos_lines = [
+              "[macos]",
+              'minimum-system-version = "12.0"',
+          ]
+          signing_identity = os.environ.get("APPLE_SIGNING_IDENTITY", "").strip()
+          if signing_identity:
+              macos_lines.append(f"signing-identity = {json.dumps(signing_identity)}")
+
+          lines = [
+              'name = "libemin"',
+              'product-name = "Libemin"',
+              f"version = {json.dumps(version)}",
+              'identifier = "io.github.mattiabonanni.libemin"',
+              'publisher = "Mattia Bonanni"',
+              'description = "Native desktop helper for booking hours into Libemax"',
+              'category = "Productivity"',
+              'out-dir = "dist"',
+              'binaries-dir = "target/release"',
+              'before-packaging-command = "cargo build --release"',
+              'icons = ["assets/icon.png", "assets/icon.ico"]',
+              '',
+              '[[binaries]]',
+              'path = "libemin"',
+              'main = true',
+              '',
+              *windows_lines,
+              '',
+              '[nsis]',
+              'installer-mode = "currentUser"',
+              'installer-icon = "assets/icon.ico"',
+              'appdata-paths = ["$APPDATA/libemin/libemin"]',
+              '',
+              '[wix]',
+              'languages = ["en-US"]',
+              '',
+              *macos_lines,
+              '',
+          ]
+
+          config_path = Path(os.environ["RUNNER_TEMP"]) / "packager-ci.toml"
+          config_path.write_text("\n".join(lines), encoding="utf-8")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              print(f"PACKAGER_CONFIG_PATH={config_path}", file=env_file)
+          PY
+
+      - name: Build native packages
+        shell: bash
+        run: cargo packager --config "$PACKAGER_CONFIG_PATH" --formats "${{ matrix.formats }}"
+
+      - name: Archive macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          tar -C dist -czf "dist/Libemin_${GITHUB_REF_NAME}_macos-${RUNNER_ARCH}.tar.gz" "Libemin.app"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          path: |
+            dist/*.dmg
+            dist/*.msi
+            dist/*setup.exe
+            dist/*macos-*.tar.gz
+
+  publish:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: package
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release-artifacts"
+          merge-multiple: true
+          path: release-artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          overwrite_files: true
