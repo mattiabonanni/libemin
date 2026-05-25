@@ -2,6 +2,8 @@
 
 Small native desktop helper for booking hours into Libemax without embedding the website.
 
+![Libemin screenshot](assets/screenshot.png)
+
 ## What it does
 
 - logs in against Libemax JSON endpoints
