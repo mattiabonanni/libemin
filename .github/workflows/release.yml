@@ -97,10 +97,10 @@ jobs:
               'category = "Productivity"',
               'out-dir = "dist"',
               'binaries-dir = "target/release"',
+              'icons = ["assets/icon.png", "assets/icon.ico"]',
               '[before-packaging-command]',
               'script = "cargo build --release"',
               f'dir = {json.dumps(os.environ["GITHUB_WORKSPACE"])}',
-              'icons = ["assets/icon.png", "assets/icon.ico"]',
               '',
               '[[binaries]]',
               'path = "libemin"',
@@ -125,6 +125,48 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         shell: bash
         run: cargo packager --config "$GITHUB_WORKSPACE/packager-ci.toml" --formats "app,dmg"
+
+      - name: Repair unsigned macOS app bundle
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            exit 0
+          fi
+
+          # Unsigned bundles still need a valid bundle signature so Gatekeeper
+          # doesn't treat the app inside the DMG as corrupted.
+          codesign --force --deep --sign - "dist/Libemin.app"
+
+          version="${GITHUB_REF_NAME#v}"
+          case "$RUNNER_ARCH" in
+            ARM64) dmg_arch="aarch64" ;;
+            X64) dmg_arch="x64" ;;
+            *)
+              echo "Unsupported RUNNER_ARCH: $RUNNER_ARCH" >&2
+              exit 1
+              ;;
+          esac
+
+          dmg_path="dist/Libemin_${version}_${dmg_arch}.dmg"
+          staging_dir="$RUNNER_TEMP/libemin-dmg"
+
+          rm -f "$dmg_path"
+          rm -rf "$staging_dir"
+          mkdir -p "$staging_dir"
+          cp -R "dist/Libemin.app" "$staging_dir/Libemin.app"
+
+          hdiutil create \
+            -volname "Libemin" \
+            -srcfolder "$staging_dir" \
+            -ov \
+            -format UDZO \
+            "$dmg_path"
+
+      - name: Verify macOS app bundle
+        shell: bash
+        run: codesign --verify --deep --strict --verbose=2 "dist/Libemin.app"
 
       - name: Archive macOS app bundle
         shell: bash
@@ -223,10 +265,10 @@ jobs:
               'category = "Productivity"',
               'out-dir = "dist"',
               'binaries-dir = "target/release"',
+              'icons = ["assets/icon.png", "assets/icon.ico"]',
               '[before-packaging-command]',
               'script = "cargo build --release"',
               f'dir = {json.dumps(os.environ["GITHUB_WORKSPACE"])}',
-              'icons = ["assets/icon.png", "assets/icon.ico"]',
               '',
               '[[binaries]]',
               'path = "libemin"',
