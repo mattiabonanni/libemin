@@ -152,7 +152,7 @@ jobs:
               '',
           ]
 
-          config_path = Path(os.environ["RUNNER_TEMP"]) / "packager-ci.toml"
+          config_path = Path(os.environ["GITHUB_WORKSPACE"]) / "packager-ci.toml"
           config_path.write_text("\n".join(lines), encoding="utf-8")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
