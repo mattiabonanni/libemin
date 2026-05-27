@@ -63,6 +63,46 @@ jobs:
           printf '%s' "$APPLE_API_KEY" > "$key_path"
           echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
+      - name: Import signing certificate into keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "No signing certificate configured; skipping keychain setup."
+            exit 0
+          fi
+
+          keychain_path="$RUNNER_TEMP/libemin-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          cert_path="$RUNNER_TEMP/certificate.p12"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$cert_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+
+          security import "$cert_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain_path" >/dev/null
+
+          # Put our keychain ahead of login so codesign finds the identity.
+          security list-keychains -d user -s "$keychain_path" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$keychain_path"
+
+          rm -f "$cert_path"
+
+          security find-identity -v -p codesigning "$keychain_path"
+
       - name: Generate macOS packager config
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -123,8 +163,47 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
         shell: bash
         run: cargo packager --config "$GITHUB_WORKSPACE/packager-ci.toml" --formats "app,dmg"
+
+      - name: Notarize and staple DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        shell: bash
+        run: |
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "No signing identity; skipping notarization."
+            exit 0
+          fi
+          if [ -z "$APPLE_API_KEY_PATH" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER" ]; then
+            echo "Missing App Store Connect API credentials; cannot notarize." >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          dmgs=(dist/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "No DMG found in dist/." >&2
+            exit 1
+          fi
+
+          for dmg in "${dmgs[@]}"; do
+            echo "Notarizing $dmg"
+            xcrun notarytool submit "$dmg" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              --wait
+
+            xcrun stapler staple "$dmg"
+            spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg" || true
+          done
+
+          # Also staple the .app so the tar.gz artifact is notarized offline-friendly.
+          xcrun stapler staple "dist/Libemin.app"
 
       - name: Repair unsigned macOS app bundle
         env:
